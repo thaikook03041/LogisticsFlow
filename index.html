@@ -29,6 +29,8 @@
                 width: 100% !important;
                 background: white !important;
                 padding: 20px !important;
+                align-items: flex-start !important;
+                justify-content: center !important;
             }
             /* ขยายป้ายให้ใหญ่ขึ้นตอนพิมพ์ เพื่อให้ติดกล่องขนาดใหญ่ได้ชัดเจน */
             #printStickerModal > div.bg-white {
@@ -527,6 +529,7 @@
         // ===================================================================
         const API_URL = 'https://script.google.com/macros/s/AKfycbyAjeBWKnA3hBO4GXb_Kt4erdVoQwkW5EneeBWkdzFZSibhLLF806qIlDotYaTLWuh9/exec';
         let cachedDB = null; // ข้อมูลล่าสุดที่โหลดมาจาก Google Sheets (เก็บไว้ในหน่วยความจำ)
+        let lastSyncedSnapshot = {}; // สำเนาข้อมูล ณ ครั้งล่าสุดที่ซิงก์กับ Sheets สำเร็จ ใช้เทียบหาว่าอะไรเปลี่ยนไปบ้าง
 
         // เรียก Google Apps Script แบบ JSONP (ใช้ <script> tag แทน fetch)
         // เพื่อเลี่ยงปัญหา CORS ที่ Apps Script ไม่รองรับตอนเรียกข้าม origin
@@ -575,6 +578,8 @@
                 const result = await callSheetAPI({ action: 'load' });
                 if (result.success) {
                     cachedDB = result.data || {};
+                    // เก็บสำเนาไว้เทียบ diff ครั้งถัดไป (ต้อง deep copy ไม่ใช่ reference เดียวกับ cachedDB)
+                    lastSyncedSnapshot = JSON.parse(JSON.stringify(cachedDB));
                     localStorage.setItem('logistics_db', JSON.stringify(cachedDB));
 
                     // ถ้าตอนนี้อยู่หน้า Admin อยู่แล้ว ให้รีเฟรชตารางด้วยข้อมูลจริง
@@ -608,11 +613,48 @@
             cachedDB = db;
             localStorage.setItem('logistics_db', JSON.stringify(db));
 
-            // ส่งข้อมูลทั้งชุดไปบันทึกที่ Google Sheets จริง (พื้นหลัง ไม่บล็อกหน้าจอ)
-            callSheetAPI({ action: 'save', db: JSON.stringify(db) }).catch(err => {
-                console.error('บันทึกไป Google Sheets ไม่สำเร็จ:', err);
-                alert('บันทึกไป Google Sheets ไม่สำเร็จ: ' + err.message + '\n\n(ข้อมูลยังถูกบันทึกในเครื่องนี้ไว้ก่อน)');
+            // หาว่ารายการไหน "เพิ่มใหม่ / แก้ไข" และรายการไหน "ถูกลบ" ไปบ้าง
+            // เทียบกับสำเนาล่าสุดที่ซิงก์สำเร็จ (ไม่ใช่ cachedDB เพราะถูก mutate ไปแล้ว)
+            const oldKeys = Object.keys(lastSyncedSnapshot);
+            const newKeys = Object.keys(db);
+
+            const changedKeys = newKeys.filter(
+                k => JSON.stringify(lastSyncedSnapshot[k]) !== JSON.stringify(db[k])
+            );
+            const removedKeys = oldKeys.filter(k => !(k in db));
+
+            // ส่งเฉพาะรายการที่เปลี่ยน/เพิ่มใหม่ (ทีละรายการ ไม่ส่งทั้งฐานข้อมูล กัน URL ยาวเกินไป)
+            changedKeys.forEach(trackingNo => {
+                const item = db[trackingNo] || {};
+                callSheetAPI({
+                    action: 'upsert',
+                    trackingNo: trackingNo,
+                    status: item.status != null ? item.status : 1,
+                    name: item.name || '',
+                    code: item.code || '',
+                    category: item.category || '',
+                    location: item.location || '',
+                    qty: item.qty || '',
+                    unit: item.unit || '',
+                    timestamp: item.timestamp || Date.now(),
+                    created: item.created || '',
+                    updated: item.updated || ''
+                }).catch(err => {
+                    console.error('บันทึกไป Google Sheets ไม่สำเร็จ (' + trackingNo + '):', err);
+                    alert('บันทึกรายการ ' + trackingNo + ' ไป Google Sheets ไม่สำเร็จ: ' + err.message + '\n\n(ข้อมูลยังถูกบันทึกในเครื่องนี้ไว้ก่อน)');
+                });
             });
+
+            // ส่งลบรายการที่หายไปจากฐานข้อมูล
+            removedKeys.forEach(trackingNo => {
+                callSheetAPI({ action: 'delete', trackingNo: trackingNo }).catch(err => {
+                    console.error('ลบใน Google Sheets ไม่สำเร็จ (' + trackingNo + '):', err);
+                    alert('ลบรายการ ' + trackingNo + ' ใน Google Sheets ไม่สำเร็จ: ' + err.message);
+                });
+            });
+
+            // อัปเดตสำเนาให้ตรงกับสถานะล่าสุด (ใช้เทียบ diff ครั้งถัดไป)
+            lastSyncedSnapshot = JSON.parse(JSON.stringify(db));
         }
 
         function getCurrentDateTime() {
